@@ -11,6 +11,13 @@ from sftp_server import PasswordAuth, ThreadedSFTPServer, load_or_create_host_ke
 
 
 class SFTPServerIntegrationTests(unittest.TestCase):
+    def _new_client(self):
+        client = paramiko.SSHClient()
+        host = f"[127.0.0.1]:{self.server.server_address[1]}"
+        client.get_host_keys().add(host, self.host_key.get_name(), self.host_key)
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        return client
+
     def test_password_auth_accepts_unicode_credentials(self):
         auth = PasswordAuth("üser", "päss")
 
@@ -34,8 +41,7 @@ class SFTPServerIntegrationTests(unittest.TestCase):
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.client = self._new_client()
         self.client.connect(
             "127.0.0.1",
             port=self.server.server_address[1],
@@ -92,8 +98,7 @@ class SFTPServerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.outside_file.read_text(), "outside")
 
     def test_rejects_invalid_password(self):
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client = self._new_client()
         with self.assertRaises(paramiko.AuthenticationException):
             client.connect(
                 "127.0.0.1",
