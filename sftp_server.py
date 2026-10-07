@@ -4,6 +4,7 @@ import hmac
 import logging
 import os
 import socketserver
+import threading
 import time
 from pathlib import Path
 
@@ -26,11 +27,14 @@ class RootedSFTPServerInterface(paramiko.SFTPServerInterface):
         super().__init__(server, *args, **kwargs)
         self.root = Path(root).resolve()
 
-    def _resolve(self, path):
+    def _resolve(self, path, follow_final=True):
         if not isinstance(path, str) or "\0" in path:
             raise ValueError("Invalid path")
         candidate = self.root / path.lstrip("/")
-        resolved = candidate.resolve()
+        if follow_final:
+            resolved = candidate.resolve()
+        else:
+            resolved = candidate.parent.resolve() / candidate.name
         if not _inside_root(self.root, resolved):
             raise PermissionError("Path is outside the SFTP root")
         return resolved
@@ -61,7 +65,9 @@ class RootedSFTPServerInterface(paramiko.SFTPServerInterface):
 
     def lstat(self, path):
         try:
-            return paramiko.SFTPAttributes.from_stat(os.lstat(self._resolve(path)))
+            return paramiko.SFTPAttributes.from_stat(
+                os.lstat(self._resolve(path, follow_final=False))
+            )
         except (OSError, ValueError) as error:
             return self._error(error)
 
@@ -78,7 +84,7 @@ class RootedSFTPServerInterface(paramiko.SFTPServerInterface):
 
     def remove(self, path):
         try:
-            os.remove(self._resolve(path))
+            os.remove(self._resolve(path, follow_final=False))
             return paramiko.SFTP_OK
         except (OSError, ValueError) as error:
             return self._error(error)
@@ -86,22 +92,22 @@ class RootedSFTPServerInterface(paramiko.SFTPServerInterface):
     def mkdir(self, path, attr):
         try:
             mode = attr.st_mode & 0o777 if attr.st_mode is not None else 0o777
-            os.mkdir(self._resolve(path), mode)
+            os.mkdir(self._resolve(path, follow_final=False), mode)
             return paramiko.SFTP_OK
         except (OSError, ValueError) as error:
             return self._error(error)
 
     def rmdir(self, path):
         try:
-            os.rmdir(self._resolve(path))
+            os.rmdir(self._resolve(path, follow_final=False))
             return paramiko.SFTP_OK
         except (OSError, ValueError) as error:
             return self._error(error)
 
     def rename(self, oldpath, newpath):
         try:
-            source = self._resolve(oldpath)
-            destination = self._resolve(newpath)
+            source = self._resolve(oldpath, follow_final=False)
+            destination = self._resolve(newpath, follow_final=False)
             if os.path.lexists(destination):
                 return paramiko.SFTP_FAILURE
             os.rename(source, destination)
@@ -111,7 +117,10 @@ class RootedSFTPServerInterface(paramiko.SFTPServerInterface):
 
     def posix_rename(self, oldpath, newpath):
         try:
-            os.replace(self._resolve(oldpath), self._resolve(newpath))
+            os.replace(
+                self._resolve(oldpath, follow_final=False),
+                self._resolve(newpath, follow_final=False),
+            )
             return paramiko.SFTP_OK
         except (OSError, ValueError) as error:
             return self._error(error)
@@ -125,7 +134,7 @@ class RootedSFTPServerInterface(paramiko.SFTPServerInterface):
 
     def readlink(self, path):
         try:
-            link = os.readlink(self._resolve(path))
+            link = os.readlink(self._resolve(path, follow_final=False))
             if os.path.isabs(link):
                 link_path = Path(link).resolve()
                 if not _inside_root(self.root, link_path):
@@ -137,7 +146,7 @@ class RootedSFTPServerInterface(paramiko.SFTPServerInterface):
 
     def symlink(self, target_path, path):
         try:
-            destination = self._resolve(path)
+            destination = self._resolve(path, follow_final=False)
             if os.path.isabs(target_path):
                 target = (self.root / target_path.lstrip("/")).resolve()
                 if not _inside_root(self.root, target):
@@ -154,9 +163,10 @@ class RootedSFTPServerInterface(paramiko.SFTPServerInterface):
 
     def canonicalize(self, path):
         try:
-            return "/" + self._resolve(path).relative_to(self.root).as_posix()
-        except (OSError, ValueError) as error:
-            return self._error(error)
+            relative_path = self._resolve(path).relative_to(self.root)
+            return "/" if relative_path == Path(".") else "/" + relative_path.as_posix()
+        except (OSError, ValueError):
+            return "/"
 
 
 class RootedSFTPHandle(paramiko.SFTPHandle):
@@ -164,21 +174,28 @@ class RootedSFTPHandle(paramiko.SFTPHandle):
         super().__init__(flags)
         self.descriptor = descriptor
         self.filename = filename
+        self.open_flags = flags
+        self._io_lock = threading.Lock()
 
     def read(self, offset, length):
         try:
-            return os.pread(self.descriptor, length, offset)
+            with self._io_lock:
+                os.lseek(self.descriptor, offset, os.SEEK_SET)
+                return os.read(self.descriptor, length)
         except OSError as error:
             return self._error(error)
 
     def write(self, offset, data):
         try:
-            written = 0
-            while written < len(data):
-                count = os.pwrite(self.descriptor, data[written:], offset + written)
-                if count == 0:
-                    return paramiko.SFTP_FAILURE
-                written += count
+            with self._io_lock:
+                if not self.open_flags & os.O_APPEND:
+                    os.lseek(self.descriptor, offset, os.SEEK_SET)
+                written = 0
+                while written < len(data):
+                    count = os.write(self.descriptor, data[written:])
+                    if count == 0:
+                        return paramiko.SFTP_FAILURE
+                    written += count
             return paramiko.SFTP_OK
         except OSError as error:
             return self._error(error)
@@ -214,8 +231,9 @@ class PasswordAuth(paramiko.ServerInterface):
         self.password = password
 
     def check_auth_password(self, username, password):
-        if hmac.compare_digest(username, self.username) and hmac.compare_digest(
-            password, self.password
+        if (
+            hmac.compare_digest(username.encode(), self.username.encode())
+            and hmac.compare_digest(password.encode(), self.password.encode())
         ):
             return paramiko.AUTH_SUCCESSFUL
         return paramiko.AUTH_FAILED

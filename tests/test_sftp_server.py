@@ -1,4 +1,5 @@
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -6,10 +7,17 @@ from pathlib import Path
 
 import paramiko
 
-from sftp_server import ThreadedSFTPServer, load_or_create_host_key
+from sftp_server import PasswordAuth, ThreadedSFTPServer, load_or_create_host_key
 
 
 class SFTPServerIntegrationTests(unittest.TestCase):
+    def test_password_auth_accepts_unicode_credentials(self):
+        auth = PasswordAuth("üser", "päss")
+
+        self.assertEqual(
+            auth.check_auth_password("üser", "päss"), paramiko.AUTH_SUCCESSFUL
+        )
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name) / "root"
@@ -76,9 +84,11 @@ class SFTPServerIntegrationTests(unittest.TestCase):
 
         escape = self.root / "escape"
         os.symlink(self.outside_file, escape)
+        self.assertTrue(stat.S_ISLNK(self.sftp.lstat("/escape").st_mode))
         with self.assertRaises(IOError):
             self.sftp.stat("/escape")
 
+        self.sftp.remove("/escape")
         self.assertEqual(self.outside_file.read_text(), "outside")
 
     def test_rejects_invalid_password(self):
